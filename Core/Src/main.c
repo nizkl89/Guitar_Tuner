@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body for guitar tuner using STM32F103VET6 with CMSIS-DSP
+  * @brief          : Main program body for guitar tuner using STM32F103VET6 with CMSIS-DSP and XPT2046 touch screen
   ******************************************************************************
   * @attention
   *
@@ -22,7 +22,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "lcd.h"
+#include "lcdtp.h"
+#include "xpt2046.h"
 #include "arm_math.h" // CMSIS-DSP library for FFT
 #include <string.h>
 #include <stdio.h>
@@ -34,6 +35,20 @@ typedef struct {
   float real;
   float imag;
 } complex_t;
+
+typedef struct {
+  uint16_t x_min;
+  uint16_t x_max;
+  uint16_t y_min;
+  uint16_t y_max;
+  const char *note;
+  float freq;
+} Button_t;
+
+typedef enum {
+  STATE_NOTE_SELECT,
+  STATE_DATA_DISPLAY
+} ScreenState;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -42,6 +57,13 @@ typedef struct {
 #define SAMPLING_RATE 4096 // Increased to capture E4 and harmonics
 #define ADC_MAX 4095
 #define MIN_MAG_THRESHOLD 0.1f // Minimum FFT magnitude to reject noise
+#define BUTTON_WIDTH 60
+#define BUTTON_HEIGHT 40
+#define BUTTON_SPACING 10
+#define BACK_BUTTON_WIDTH 60
+#define BACK_BUTTON_HEIGHT 30
+#define WIDTH_EN_CHAR 16
+#define HEIGHT_EN_CHAR 24
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,7 +80,7 @@ TIM_HandleTypeDef htim3;
 SRAM_HandleTypeDef hsram1;
 
 /* USER CODE BEGIN PV */
-uint16_t adc_buffer[2][FFT_SIZE] _attribute_((aligned(4))) = {{0xFFFF}, {0xFFFF}}; // Double buffer, initialized to 0xFFFF for debug
+uint16_t adc_buffer[2][FFT_SIZE] __attribute__((aligned(4))) = {{0xFFFF}, {0xFFFF}}; // Double buffer
 float fft_input[FFT_SIZE]; // Input buffer for CMSIS-DSP FFT
 float fft_output[FFT_SIZE]; // Output buffer for CMSIS-DSP FFT (complex interleaved)
 arm_rfft_fast_instance_f32 fft_handler; // CMSIS-DSP FFT instance
@@ -68,6 +90,18 @@ volatile uint8_t processing_buffer = 0; // Buffer index for main loop processing
 
 const float note_freqs[] = {82.41, 110.00, 146.83, 196.00, 246.94, 329.63}; // Standard guitar tuning frequencies
 const char *note_names[] = {"E2", "A2", "D3", "G3", "B3", "E4"};
+Button_t buttons[] = {
+  {20, 20 + BUTTON_WIDTH, 40, 40 + BUTTON_HEIGHT, "E2", 82.41},
+  {90, 90 + BUTTON_WIDTH, 40, 40 + BUTTON_HEIGHT, "A2", 110.00},
+  {160, 160 + BUTTON_WIDTH, 40, 40 + BUTTON_HEIGHT, "D3", 146.83},
+  {20, 20 + BUTTON_WIDTH, 100, 100 + BUTTON_HEIGHT, "G3", 196.00},
+  {90, 90 + BUTTON_WIDTH, 100, 100 + BUTTON_HEIGHT, "B3", 246.94},
+  {160, 160 + BUTTON_WIDTH, 100, 100 + BUTTON_HEIGHT, "E4", 329.63}
+};
+const uint8_t num_buttons = 6;
+Button_t back_button = {10, 10 + BACK_BUTTON_WIDTH, 280, 280 + BACK_BUTTON_HEIGHT, "Back", 0.0f};
+int selected_note_idx = -1; // No note selected initially
+ScreenState screen_state = STATE_NOTE_SELECT; // Start with note selection
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -83,7 +117,10 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc);
 void apply_hann_window(float *data, uint32_t N);
 void high_pass_filter(float *data, uint32_t N);
 float find_dominant_freq(float *fft_out, uint32_t N);
-void map_to_note(float freq, char *note, char *status);
+void map_to_note(float freq, float target_freq, char *note, char *status);
+void draw_buttons(void);
+void draw_data_screen(void);
+void check_touch(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -136,14 +173,11 @@ float find_dominant_freq(float *fft_out, uint32_t N) {
       max_idx = i;
     }
   }
-  // Debug signal magnitude
-  char buff[50];
-  sprintf(buff, "Max Mag: %d.%02d    ", (int)max_mag, (int)((max_mag - (int)max_mag) * 100));
-  LCD_DrawString(20, 150, buff);
-
   // Check for sufficient signal strength
   if (max_mag < MIN_MAG_THRESHOLD) {
-    LCD_DrawString(20, 110, "No Signal          ");
+    if (screen_state == STATE_DATA_DISPLAY) {
+      LCD_DrawString(20, 140, "No Signal          ");
+    }
     return 0.0f; // Return 0 Hz for no valid signal
   }
 
@@ -156,9 +190,12 @@ float find_dominant_freq(float *fft_out, uint32_t N) {
     float p = (y3 - y1) / (2.0f * (2.0f * y2 - y1 - y3));
     freq = (float)(max_idx + p) * SAMPLING_RATE / N;
   }
-  // Debug raw frequency
-  sprintf(buff, "Raw Freq: %d.%02d Hz    ", (int)freq, (int)((freq - (int)freq) * 100));
-  LCD_DrawString(20, 110, buff);
+  if (screen_state == STATE_DATA_DISPLAY) {
+    // Debug raw frequency
+    char buff[50];
+    sprintf(buff, "Raw Freq: %d.%02d Hz", (int)freq, (int)((freq - (int)freq) * 100));
+    LCD_DrawString(20, 140, buff);
+  }
   // Check for second harmonic for guitar signals, only for freq < 220 Hz
   if (freq < 220.0f) {
     float fund = freq / 2;
@@ -173,35 +210,99 @@ float find_dominant_freq(float *fft_out, uint32_t N) {
 }
 
 /**
-  * @brief  Map detected frequency to nearest guitar note and tuning status
+  * @brief  Map detected frequency to tuning status relative to target note
   * @param  freq: Detected frequency
+  * @param  target_freq: Target note frequency
   * @param  note: Output buffer for note name
   * @param  status: Output buffer for tuning status
   * @retval None
   */
-void map_to_note(float freq, char *note, char *status) {
+void map_to_note(float freq, float target_freq, char *note, char *status) {
+  strcpy(note, note_names[selected_note_idx]); // Always set to selected note
   if (freq < 50.0f) {
-    strcpy(note, "--");
     strcpy(status, "No Signal");
     return;
   }
-  float min_diff = 1000.0f;
-  int closest_note = 0;
-  for (int i = 0; i < 6; i++) {
-    float diff = fabs(freq - note_freqs[i]);
-    if (diff < min_diff) {
-      min_diff = diff;
-      closest_note = i;
-    }
-  }
-  strcpy(note, note_names[closest_note]);
-  float target = note_freqs[closest_note];
-  if (fabs(freq - target) / target < 0.02f)
+  if (fabs(freq - target_freq) / target_freq < 0.02f)
     strcpy(status, "In Tune");
-  else if (freq < target)
+  else if (freq < target_freq)
     strcpy(status, "Flat");
   else
     strcpy(status, "Sharp");
+}
+
+/**
+  * @brief  Draw buttons for guitar notes
+  * @param  None
+  * @retval None
+  */
+void draw_buttons(void) {
+  __disable_irq(); // Prevent interrupts during screen update
+  LCD_Clear(0, 0, 240, 320, BACKGROUND); // Double clear for reliability
+  LCD_Clear(0, 0, 240, 320, BACKGROUND);
+  for (uint8_t i = 0; i < num_buttons; i++) {
+    // Draw button rectangle
+    LCD_DrawLine(buttons[i].x_min, buttons[i].y_min, buttons[i].x_max, buttons[i].y_min, BLACK);
+    LCD_DrawLine(buttons[i].x_max, buttons[i].y_min, buttons[i].x_max, buttons[i].y_max, BLACK);
+    LCD_DrawLine(buttons[i].x_max, buttons[i].y_max, buttons[i].x_min, buttons[i].y_max, BLACK);
+    LCD_DrawLine(buttons[i].x_min, buttons[i].y_max, buttons[i].x_min, buttons[i].y_min, BLACK);
+    // Draw note name
+    uint16_t text_x = buttons[i].x_min + (BUTTON_WIDTH - strlen(buttons[i].note) * WIDTH_EN_CHAR) / 2;
+    uint16_t text_y = buttons[i].y_min + (BUTTON_HEIGHT - HEIGHT_EN_CHAR) / 2;
+    LCD_DrawString_Color(text_x, text_y, buttons[i].note, WHITE, BLACK);
+  }
+  __enable_irq();
+}
+
+/**
+  * @brief  Draw data screen with tuning information and Back button
+  * @param  None
+  * @retval None
+  */
+void draw_data_screen(void) {
+  __disable_irq(); // Prevent interrupts during screen update
+  LCD_Clear(0, 0, 240, 320, BACKGROUND);
+  // Draw Back button
+  LCD_DrawLine(back_button.x_min, back_button.y_min, back_button.x_max, back_button.y_min, BLACK);
+  LCD_DrawLine(back_button.x_max, back_button.y_min, back_button.x_max, back_button.y_max, BLACK);
+  LCD_DrawLine(back_button.x_max, back_button.y_max, back_button.x_min, back_button.y_max, BLACK);
+  LCD_DrawLine(back_button.x_min, back_button.y_max, back_button.x_min, back_button.y_min, BLACK);
+  uint16_t text_x = back_button.x_min + (BACK_BUTTON_WIDTH - strlen(back_button.note) * WIDTH_EN_CHAR) / 2;
+  uint16_t text_y = back_button.y_min + (BACK_BUTTON_HEIGHT - HEIGHT_EN_CHAR) / 2;
+  LCD_DrawString_Color(text_x, text_y, back_button.note, WHITE, BLACK);
+  __enable_irq();
+}
+
+/**
+  * @brief  Check for touch input and update state
+  * @param  None
+  * @retval None
+  */
+void check_touch(void) {
+  strType_XPT2046_Coordinate touch_coord;
+  if (ucXPT2046_TouchFlag && XPT2046_Get_TouchedPoint(&touch_coord, &strXPT2046_TouchPara)) {
+    if (screen_state == STATE_NOTE_SELECT) {
+      for (uint8_t i = 0; i < num_buttons; i++) {
+        if (touch_coord.x >= buttons[i].x_min && touch_coord.x <= buttons[i].x_max &&
+            touch_coord.y >= buttons[i].y_min && touch_coord.y <= buttons[i].y_max) {
+          selected_note_idx = i;
+          screen_state = STATE_DATA_DISPLAY;
+          adc_complete = 0; // Reset to ensure fresh data
+          draw_data_screen();
+          break;
+        }
+      }
+    } else if (screen_state == STATE_DATA_DISPLAY) {
+      if (touch_coord.x >= back_button.x_min && touch_coord.x <= back_button.x_max &&
+          touch_coord.y >= back_button.y_min && touch_coord.y <= back_button.y_max) {
+        selected_note_idx = -1;
+        screen_state = STATE_NOTE_SELECT;
+        adc_complete = 0; // Prevent immediate data redraw
+        draw_buttons();
+      }
+    }
+    ucXPT2046_TouchFlag = 0;
+  }
 }
 /* USER CODE END 0 */
 
@@ -239,20 +340,26 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
-  // Reset LCD (PD12, active-low)
+  // Initialize LCD
   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_RESET);
   HAL_Delay(20);
   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET);
   HAL_Delay(200);
-
-  // Backlight/control (PE1, active-high)
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_SET);
   HAL_Delay(50);
-
   LCD_INIT();
   HAL_Delay(200);
-  LCD_DrawString(20, 10, "Tuner Starting...");
 
+  // Initialize touch screen
+  macXPT2046_CS_DISABLE();
+//  XPT2046_Init();
+  while (!XPT2046_Touch_Calibrate()); // Run calibration until successful
+  #define macXPT2046_Coordinate_GramScan 1 // Portrait 240x320, top-left origin
+  LCD_GramScan(macXPT2046_Coordinate_GramScan); // Set orientation
+  LCD_Clear(0, 0, 240, 320, BACKGROUND);
+  draw_buttons();
+
+  // Start ADC and timer
   HAL_TIM_Base_Start(&htim3);
   HAL_ADCEx_Calibration_Start(&hadc1);
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer[0], FFT_SIZE);
@@ -265,24 +372,12 @@ int main(void)
   char note[10], status[20];
   while (1)
   {
-    if (adc_complete) {
-      adc_complete = 0; // Reset flag immediately to avoid reprocessing
-      uint8_t buf_to_process = processing_buffer; // Use synchronized buffer index
+    // Check for touch input
+    check_touch();
 
-      // Debug: Display first few ADC values to check buffer contents
-      sprintf(buff, "Buf %d: %u %u %u    ", buf_to_process,
-              adc_buffer[buf_to_process][0], adc_buffer[buf_to_process][1],
-              adc_buffer[buf_to_process][2]);
-      LCD_DrawString(20, 130, buff);
-
-      // Display raw ADC value
-      sprintf(buff, "ADC: %u    ", adc_buffer[buf_to_process][0]);
-      LCD_DrawString(20, 30, buff);
-
-      // Check for ADC overrun (OVR bit is bit 5 in ADC_SR)
-      if (hadc1.Instance->SR & (1U << 5)) {
-        LCD_DrawString(20, 170, "ADC Overrun");
-      }
+    if (screen_state == STATE_DATA_DISPLAY && adc_complete && selected_note_idx >= 0) {
+      adc_complete = 0; // Reset flag
+      uint8_t buf_to_process = processing_buffer;
 
       // Remove DC offset and prepare FFT input
       float mean = 0.0f;
@@ -294,43 +389,41 @@ int main(void)
         fft_input[i] = (float)(adc_buffer[buf_to_process][i] - mean) / (ADC_MAX / 2.0f); // Scale to [-1, 1]
       }
 
-      // Apply high-pass filter to remove low-frequency noise from guitar signal
+      // Apply high-pass filter
       high_pass_filter(fft_input, FFT_SIZE);
 
       // Apply Hann window
       apply_hann_window(fft_input, FFT_SIZE);
 
-      // Compute FFT using CMSIS-DSP
+      // Compute FFT
       arm_rfft_fast_f32(&fft_handler, fft_input, fft_output, 0);
       freq = find_dominant_freq(fft_output, FFT_SIZE);
 
       // Get note and status
-      map_to_note(freq, note, status);
+      map_to_note(freq, buttons[selected_note_idx].freq, note, status);
 
-      // Find note frequency
-      float note_freq = 0.0f;
-      for (int i = 0; i < 6; i++) {
-        if (strcmp(note, note_names[i]) == 0) {
-          note_freq = note_freqs[i];
-          break;
-        }
-      }
+      // Display data
+      sprintf(buff, "ADC: %u", adc_buffer[buf_to_process][0]);
+      LCD_DrawString(20, 20, buff);
 
-      // Display note with standard frequency
-      int note_int_part = (int)note_freq;
-      int note_frac_part = (int)((note_freq - note_int_part) * 100);
-      sprintf(buff, "Note: %s (%d.%02d Hz)    ", note, note_int_part, note_frac_part);
+      LCD_DrawString(20, 50, "                    "); // Clear previous target
+      sprintf(buff, "Target: %s", note);
       LCD_DrawString(20, 50, buff);
 
-      // Display status
-      sprintf(buff, "Status: %s    ", status);
-      LCD_DrawString(20, 70, buff);
+      LCD_DrawString(20, 80, "                    "); // Clear previous status
+      sprintf(buff, "Status: %s", status);
+      LCD_DrawString(20, 80, buff);
 
-      // Display current frequency
       int freq_int_part = (int)freq;
       int freq_frac_part = (int)((freq - freq_int_part) * 100);
-      sprintf(buff, "Freq: %d.%02d Hz    ", freq_int_part, freq_frac_part);
-      LCD_DrawString(20, 90, buff);
+      sprintf(buff, "Freq: %d.%02d Hz", freq_int_part, freq_frac_part);
+      LCD_DrawString(20, 110, buff);
+
+      if (hadc1.Instance->SR & (1U << 5)) {
+        LCD_DrawString(20, 170, "ADC Overrun");
+      } else {
+        LCD_DrawString(20, 170, "                "); // Clear overrun message
+      }
 
       // LED indicators
       if (strcmp(status, "In Tune") == 0) {
@@ -343,10 +436,10 @@ int main(void)
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); // Blue on
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_5, GPIO_PIN_SET);
       } else {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_5, GPIO_PIN_SET); // All off for no signal
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_5, GPIO_PIN_SET); // All off
       }
     }
-    HAL_Delay(10); // Reduced delay to improve responsiveness
+    HAL_Delay(20); // Increased delay to test timing
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -544,13 +637,13 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_5, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12|GPIO_PIN_13, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2, GPIO_PIN_SET);
 
   /*Configure GPIO pins : PB0 PB1 PB5 */
   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_5;
@@ -559,19 +652,35 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PD12 */
-  GPIO_InitStruct.Pin = GPIO_PIN_12;
+  /*Configure GPIO pins : PD12 PD13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_13;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PE1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  /*Configure GPIO pins : PE0 PE1 PE2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PE3 */
+  GPIO_InitStruct.Pin = GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PE4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /* EXTI interrupt init */
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
 }
 
 /**
@@ -623,7 +732,6 @@ static void MX_FSMC_Init(void)
   */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   if (hadc->Instance == ADC1) {
-    // Verify DMA state before proceeding
     if (HAL_DMA_GetState(&hdma_adc1) == HAL_DMA_STATE_READY) {
       // Critical section to synchronize buffer toggle
       __disable_irq();
@@ -634,18 +742,13 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
       // Stop current DMA transfer
       if (HAL_ADC_Stop_DMA(&hadc1) != HAL_OK) {
-        LCD_DrawString(20, 150, "DMA Stop Error");
+        // Error handling without display
       }
 
       // Start DMA transfer for the new buffer
       if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer[buffer_idx], FFT_SIZE) != HAL_OK) {
-        LCD_DrawString(20, 150, "DMA Start Error");
+        // Error handling without display
       }
-    } else {
-      // Log DMA state for debugging
-      char buff[50];
-      sprintf(buff, "DMA State: %d", HAL_DMA_GetState(&hdma_adc1));
-      LCD_DrawString(20, 150, buff);
     }
   }
 }
