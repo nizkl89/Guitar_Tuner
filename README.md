@@ -2,6 +2,8 @@
 
 This project implements a guitar tuner on the STM32F103VET6 microcontroller using a 2048-point FFT (via CMSIS-DSP) to detect note frequencies from an ADC-sampled microphone input. The tuner features a 240x320 LCD with an XPT2046 touch screen for selecting guitar notes (E2, A2, D3, G3, B3, E4) and an L298N motor driver for automatic tuning. The system supports manual note selection, displays tuning status ("In Tune," "Flat," "Sharp"), and controls a motor to adjust string tension.
 
+![image](final_product.jpeg)
+
 ## Features
 - **Frequency Detection**: Uses a 2048-point FFT with a sampling rate of 4098.36 Hz to detect frequencies between 50 Hz and 400 Hz.
 - **Signal Processing**:
