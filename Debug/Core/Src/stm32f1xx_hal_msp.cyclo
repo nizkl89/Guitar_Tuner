@@ -1,9 +1,9 @@
 ../Core/Src/stm32f1xx_hal_msp.c:64:6:HAL_MspInit	1
 ../Core/Src/stm32f1xx_hal_msp.c:91:6:HAL_ADC_MspInit	3
 ../Core/Src/stm32f1xx_hal_msp.c:141:6:HAL_ADC_MspDeInit	2
-../Core/Src/stm32f1xx_hal_msp.c:171:6:HAL_TIM_Base_MspInit	2
-../Core/Src/stm32f1xx_hal_msp.c:197:6:HAL_TIM_Base_MspDeInit	2
-../Core/Src/stm32f1xx_hal_msp.c:218:13:HAL_FSMC_MspInit	2
-../Core/Src/stm32f1xx_hal_msp.c:272:6:HAL_SRAM_MspInit	1
-../Core/Src/stm32f1xx_hal_msp.c:284:13:HAL_FSMC_MspDeInit	2
-../Core/Src/stm32f1xx_hal_msp.c:330:6:HAL_SRAM_MspDeInit	1
+../Core/Src/stm32f1xx_hal_msp.c:171:6:HAL_TIM_Base_MspInit	3
+../Core/Src/stm32f1xx_hal_msp.c:218:6:HAL_TIM_Base_MspDeInit	3
+../Core/Src/stm32f1xx_hal_msp.c:256:13:HAL_FSMC_MspInit	2
+../Core/Src/stm32f1xx_hal_msp.c:310:6:HAL_SRAM_MspInit	1
+../Core/Src/stm32f1xx_hal_msp.c:322:13:HAL_FSMC_MspDeInit	2
+../Core/Src/stm32f1xx_hal_msp.c:368:6:HAL_SRAM_MspDeInit	1
